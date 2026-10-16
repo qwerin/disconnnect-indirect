@@ -1,0 +1,4 @@
+/target
+*.pem
+*.p12
+.env
