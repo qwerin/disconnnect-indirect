@@ -280,6 +280,142 @@ mod tests {
     }
 
     #[test]
+    fn protocol_roundtrip() {
+        for (s, p) in [
+            ("TCPIP", Protocol::Tcpip),
+            ("none", Protocol::None),
+            ("tls1.2", Protocol::Tls12),
+            ("TLS1.3", Protocol::Tls13),
+        ] {
+            assert_eq!(s.parse::<Protocol>().unwrap(), p);
+            assert_eq!(p.as_str().parse::<Protocol>().unwrap(), p);
+        }
+        let custom = "SSL".parse::<Protocol>().unwrap();
+        assert_eq!(custom, Protocol::Custom("SSL".into()));
+        assert_eq!(custom.as_str(), "SSL");
+    }
+
+    #[test]
+    fn signon_body_shape() {
+        let v = serde_json::to_value(SignonBody {
+            ip_address: "h",
+            port: 1363,
+            protocol: "TCPIP",
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            json!({ "ipAddress": "h", "port": 1363, "protocol": "TCPIP" })
+        );
+    }
+
+    #[test]
+    fn submit_body_defaults_to_empty_strings() {
+        let v = serde_json::to_value(SubmitProcess::new("P")).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj.len(), 18);
+        assert_eq!(obj["processFile"], "P");
+        assert!(obj
+            .iter()
+            .filter(|(k, _)| *k != "processFile")
+            .all(|(_, v)| v == ""));
+    }
+
+    #[test]
+    fn submit_builder_setters() {
+        let v = serde_json::to_value(
+            SubmitProcess::new("P")
+                .secondary_node("S")
+                .hold("yes")
+                .max_delay("unlimited")
+                .new_name("N"),
+        )
+        .unwrap();
+        assert_eq!(v["secondaryNode"], "S");
+        assert_eq!(v["hold"], "yes");
+        assert_eq!(v["maxDelay"], "unlimited");
+        assert_eq!(v["newName"], "N");
+    }
+
+    #[test]
+    fn delete_process_body_and_filter() {
+        assert!(DeleteProcess::default().is_empty_filter());
+        let d = DeleteProcess::by_number(5).force();
+        assert!(!d.is_empty_filter());
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "processName": "", "processNumber": "5", "secondaryNode": "",
+                "submitter": "", "hold": "", "force": "yes"
+            })
+        );
+        assert!(!DeleteProcess::by_name("X").is_empty_filter());
+    }
+
+    #[test]
+    fn query_builders() {
+        assert_eq!(
+            Query::process_number(7).param("a", "b").params,
+            vec![
+                ("processNumber".into(), "7".into()),
+                ("a".into(), "b".into())
+            ]
+        );
+        assert_eq!(
+            Query::process_name("P").params,
+            vec![("processName".into(), "P".into())]
+        );
+        assert!(Query::new().params.is_empty());
+    }
+
+    #[test]
+    fn process_number_variants() {
+        assert_eq!(
+            extract_process_number(&json!({ "processNumber": 1 })),
+            Some(1)
+        );
+        assert_eq!(
+            extract_process_number(&json!({ "PNUMBER": " 2 " })),
+            Some(2)
+        );
+        assert_eq!(extract_process_number(&json!([[{ "pnum": 3 }]])), Some(3));
+        assert_eq!(
+            extract_process_number(&json!({ "processNumber": "abc" })),
+            None
+        );
+        assert_eq!(extract_process_number(&json!({ "other": 1 })), None);
+        assert_eq!(extract_process_number(&json!("126")), None);
+        assert_eq!(extract_process_number(&Value::Null), None);
+    }
+
+    #[test]
+    fn stat_record_not_found() {
+        assert!(find_stat_record(&json!([{ "recordId": "PSTR" }]), "PRED").is_none());
+        // hodnota PRED pod klíčem bez "rec" se nepočítá
+        assert!(find_stat_record(&json!([{ "message": "PRED" }]), "PRED").is_none());
+        assert!(find_stat_record(&json!({ "a": { "recId": " pred " } }), "PRED").is_some());
+    }
+
+    #[test]
+    fn completion_code_variants() {
+        assert_eq!(
+            completion_code(&json!({ "ccode": 0 })).as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            completion_code(&json!({ "completionCode": " 8 " })).as_deref(),
+            Some("8")
+        );
+        assert_eq!(
+            completion_code(&json!({ "CCOD": "16" })).as_deref(),
+            Some("16")
+        );
+        assert_eq!(completion_code(&json!({ "x": 1 })), None);
+        assert_eq!(completion_code(&json!([1])), None);
+    }
+
+    #[test]
     fn finds_pred_record_and_ccode() {
         let v = json!({ "records": [
             { "recordId": "PSTR", "ccode": "0" },

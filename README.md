@@ -79,13 +79,25 @@ Exit kód: `0` OK, `2` proces skončil s nenulovým completion code, `1` chyba.
 - `/version` endpoint existuje od CDWS 6.3.0.9.
 - `CDWS_INSECURE` / `accept_invalid_certs` vypíná ověřování TLS – používejte jen v testu.
 
-## Vývoj
+## Vývoj a testy
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features          # unit + integrační + CLI + doc testy
+cargo test --no-default-features   # jen knihovna, bez CLI
 ```
+
+Testy nepotřebují reálný Connect:Direct – běží proti mock CDWS serveru ([wiremock](https://crates.io/crates/wiremock)):
+
+- `src/*` – unit testy generátoru procesů, serializace a heuristik nad odpověďmi
+- `tests/client.rs` – knihovna: sign-on (Basic i certifikát), XSRF z hlavičky i cookie, re-login při 401,
+  sdílená session při souběžných voláních, submit/select/delete, statistiky, polling a timeout, chybové stavy
+- `tests/cli.rs` – binárka `cdctl`: dry-run, validace vstupů, exit kódy, všechny subpříkazy end-to-end
+
+CI (GitHub Actions) spouští rustfmt, clippy, testy na Linuxu/macOS/Windows (stable + beta),
+kontrolu MSRV (Rust 1.88), build dokumentace, měření pokrytí (cargo-llvm-cov) a bezpečnostní audit
+závislostí (cargo-deny). Navíc jednou týdně.
 
 Pull requesty a issues jsou vítány – hlavně zkušenosti s reálnými odpověďmi různých verzí CDWS,
 ať jde heuristiku ve `models.rs` nahradit pevně typovanými strukturami.

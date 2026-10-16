@@ -260,5 +260,135 @@ mod tests {
             .render()
             .is_err());
         assert!(CopyProcess::send("1ABC", "N", "/a", "/b").render().is_err());
+        assert!(CopyProcess::send("", "N", "/a", "/b").render().is_err());
+        assert!(CopyProcess::send("AB-C", "N", "/a", "/b").render().is_err());
+    }
+
+    #[test]
+    fn accepts_max_length_name() {
+        assert!(CopyProcess::send("ABCDEFG8", "N", "/a", "/b")
+            .render()
+            .is_ok());
+    }
+
+    #[test]
+    fn name_and_step_are_uppercased() {
+        let p = CopyProcess::send("payout", "N", "/a", "/b")
+            .step_label("copy1")
+            .render()
+            .unwrap();
+        assert!(p.starts_with("PAYOUT PROCESS\n"));
+        assert!(p.contains("\nCOPY1 COPY\n"));
+    }
+
+    #[test]
+    fn rejects_bad_step_label() {
+        let r = CopyProcess::send("P", "N", "/a", "/b")
+            .step_label("STEP_01")
+            .render();
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn rejects_bad_snode() {
+        for snode in ["", "HAS SPACE", "WAY-TOO-LONG-NODE-NAME", "BAD(NODE)"] {
+            let r = CopyProcess::send("P", snode, "/a", "/b").render();
+            assert!(r.is_err(), "snode `{snode}` should be rejected");
+        }
+        assert!(CopyProcess::send("P", "cd.node_1-A", "/a", "/b")
+            .render()
+            .is_ok());
+    }
+
+    #[test]
+    fn rejects_bad_paths() {
+        for path in ["", "/a\"b", "/a\nb", "/a\rb"] {
+            let r = CopyProcess::send("P", "N", path, "/b").render();
+            assert!(r.is_err(), "path {path:?} should be rejected");
+            let r = CopyProcess::send("P", "N", "/a", path).render();
+            assert!(r.is_err(), "path {path:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn quotes_paths_with_special_chars() {
+        for path in ["/a b", "/a(1)", "/a,b", "/a=b", "/a;b", "/a&b", "C:\\x\ty"] {
+            let p = CopyProcess::send("P", "N", path, "/b").render().unwrap();
+            assert!(
+                p.contains(&format!("FILE=\"{path}\"")),
+                "{path:?} not quoted:\n{p}"
+            );
+        }
+        let p = CopyProcess::send("P", "N", "C:\\data\\x.txt", "/b")
+            .render()
+            .unwrap();
+        assert!(p.contains("FILE=C:\\data\\x.txt\n"));
+    }
+
+    #[test]
+    fn hold_flag() {
+        let p = CopyProcess::send("P", "N", "/a", "/b").render().unwrap();
+        assert!(p.contains("HOLD=NO"));
+        let p = CopyProcess::send("P", "N", "/a", "/b")
+            .hold(true)
+            .render()
+            .unwrap();
+        assert!(p.contains("HOLD=YES"));
+    }
+
+    #[test]
+    fn sysopts_are_inserted_verbatim_in_right_blocks() {
+        let p = CopyProcess::send("P", "N", "/a", "/b")
+            .from_sysopts("\":datatype=text:\"")
+            .to_sysopts("\":xlate=yes:\"")
+            .render()
+            .unwrap();
+        let from = p.find("FROM (").unwrap();
+        let to = p.find("TO (").unwrap();
+        let f = p.find("SYSOPTS=\":datatype=text:\"").unwrap();
+        let t = p.find("SYSOPTS=\":xlate=yes:\"").unwrap();
+        assert!(from < f && f < to && to < t);
+    }
+
+    #[test]
+    fn sysopts_with_newline_rejected() {
+        let r = CopyProcess::send("P", "N", "/a", "/b")
+            .from_sysopts("x\nPEND")
+            .render();
+        assert!(r.is_err());
+        let r = CopyProcess::send("P", "N", "/a", "/b")
+            .to_sysopts("x\ry")
+            .render();
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn all_dispositions_render() {
+        for (d, s) in [
+            (Disp::New, "NEW"),
+            (Disp::Old, "OLD"),
+            (Disp::Mod, "MOD"),
+            (Disp::Rpl, "RPL"),
+            (Disp::Shr, "SHR"),
+        ] {
+            let p = CopyProcess::send("P", "N", "/a", "/b")
+                .disp(d)
+                .render()
+                .unwrap();
+            assert!(p.contains(&format!("DISP={s}\n")));
+            assert_eq!(s.to_lowercase().parse::<Disp>().unwrap(), d);
+        }
+        assert!("bogus".parse::<Disp>().is_err());
+        assert_eq!(Disp::default(), Disp::Rpl);
+    }
+
+    #[test]
+    fn structure_is_balanced() {
+        let p = CopyProcess::receive("P", "N", "/a b", "/c")
+            .render()
+            .unwrap();
+        assert_eq!(p.matches('(').count(), p.matches(')').count());
+        assert_eq!(p.lines().last(), Some("PEND"));
+        assert_eq!(p.matches("PROCESS").count(), 1);
     }
 }

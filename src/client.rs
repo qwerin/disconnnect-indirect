@@ -109,12 +109,24 @@ impl CdClient {
             .danger_accept_invalid_certs(cfg.accept_invalid_certs);
 
         for pem in &cfg.extra_root_certs_pem {
+            if !contains_pem_block(pem, "CERTIFICATE") {
+                return Err(Error::Config(
+                    "CA certificate is not a PEM `CERTIFICATE` block".into(),
+                ));
+            }
             let cert = reqwest::Certificate::from_pem(pem)
                 .map_err(|e| Error::Config(format!("invalid CA certificate: {e}")))?;
             builder = builder.add_root_certificate(cert);
         }
 
         if let Credentials::Certificate { identity_pem } = &cfg.credentials {
+            if !contains_pem_block(identity_pem, "CERTIFICATE")
+                || !contains_pem_block(identity_pem, "PRIVATE KEY")
+            {
+                return Err(Error::Config(
+                    "client identity PEM must contain a certificate and a private key".into(),
+                ));
+            }
             let id = reqwest::Identity::from_pem(identity_pem)
                 .map_err(|e| Error::Config(format!("invalid client identity PEM: {e}")))?;
             builder = builder.identity(id);
@@ -338,6 +350,14 @@ impl CdClient {
 }
 
 // -------------------------------------------------------------------- helpers
+
+/// Hrubá kontrola, že PEM obsahuje blok daného typu (např. `CERTIFICATE`,
+/// `PRIVATE KEY` pokryje i `RSA PRIVATE KEY` / `EC PRIVATE KEY`).
+fn contains_pem_block(pem: &[u8], kind: &str) -> bool {
+    let text = String::from_utf8_lossy(pem);
+    text.lines()
+        .any(|l| l.starts_with("-----BEGIN ") && l.contains(kind) && l.ends_with("-----"))
+}
 
 fn header_str(h: &HeaderMap, name: &str) -> Option<String> {
     h.get(name)?
