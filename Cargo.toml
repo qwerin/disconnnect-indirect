@@ -1,0 +1,35 @@
+[package]
+name = "connect-direct"
+version = "0.1.0"
+edition = "2021"
+description = "Async Rust klient pro IBM Sterling Connect:Direct Web Services (CDWS) REST API"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/qwerin/disconnnect-indirect"
+keywords = ["connect-direct", "ibm", "sterling", "file-transfer", "mft"]
+categories = ["api-bindings", "command-line-utilities", "network-programming"]
+
+[lib]
+name = "connect_direct"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cdctl"
+path = "src/bin/cdctl.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+cli = ["dep:clap", "tokio/macros", "tokio/rt-multi-thread"]
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies"] }
+tokio = { version = "1", features = ["sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+thiserror = "2"
+clap = { version = "4", features = ["derive", "env"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
