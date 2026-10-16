@@ -1,6 +1,6 @@
 [package]
 name = "connect-direct"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Async Rust klient pro IBM Sterling Connect:Direct Web Services (CDWS) REST API"
