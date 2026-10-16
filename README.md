@@ -10,6 +10,23 @@ submit procesu (text nebo `.cdp` na serveru), generátor COPY procesů, select/d
 select statistics, čekání na dokončení procesu, verze CDWS a obecné `call()` pro ostatní
 endpointy (netmap, user proxy, Secure+, …). TLS přes rustls, vlastní CA i certifikátová autentizace.
 
+## Stažení (Linux amd64)
+
+Hotová statická binárka `cdctl` (musl, bez závislostí na glibc/OpenSSL – běží na RHEL, SLES, Ubuntu, Alpine…)
+je u každého [release](https://github.com/qwerin/disconnnect-indirect/releases):
+
+```bash
+curl -LO https://github.com/qwerin/disconnnect-indirect/releases/latest/download/cdctl-x86_64-unknown-linux-musl.tar.gz
+curl -LO https://github.com/qwerin/disconnnect-indirect/releases/latest/download/cdctl-x86_64-unknown-linux-musl.tar.gz.sha256
+sha256sum -c cdctl-x86_64-unknown-linux-musl.tar.gz.sha256
+tar xzf cdctl-x86_64-unknown-linux-musl.tar.gz && ./cdctl --version
+```
+
+Build z každého commitu v `main` je také v záložce *Actions* jako artefakt `cdctl-linux-amd64`.
+
+**Vydání nové verze:** zvednout `version` v `Cargo.toml`, commit, pak `git tag v0.2.0 && git push --tags`.
+Workflow ověří, že tag odpovídá verzi, sestaví binárku a založí GitHub Release.
+
 ## Knihovna
 
 ```toml

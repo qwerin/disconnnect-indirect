@@ -47,3 +47,8 @@ path = "tests/client.rs"
 name = "cli"
 path = "tests/cli.rs"
 required-features = ["cli"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

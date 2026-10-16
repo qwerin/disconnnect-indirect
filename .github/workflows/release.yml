@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  build-linux-amd64:
+    name: build cdctl (linux amd64, static)
+    runs-on: ubuntu-latest
+    outputs:
+      archive: ${{ steps.package.outputs.archive }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.TARGET }}
+
+      - name: check tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          CRATE_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "v${CRATE_VERSION}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${CRATE_VERSION}"
+            exit 1
+          fi
+
+      - name: build release binary
+        run: cargo build --release --locked --target "$TARGET" --bin cdctl
+
+      - name: verify binary is static and runs
+        run: |
+          BIN="target/$TARGET/release/cdctl"
+          file "$BIN"
+          file "$BIN" | grep -Eq 'statically linked|static-pie linked'
+          "$BIN" --version
+          "$BIN" send --snode SMOKE --from /a --to /b --dry-run | grep -q '^PEND$'
+
+      - name: package
+        id: package
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            ARCHIVE="cdctl-${TARGET}.tar.gz"
+          else
+            ARCHIVE="cdctl-${GITHUB_SHA::7}-${TARGET}.tar.gz"
+          fi
+          mkdir -p staging dist
+          cp "target/$TARGET/release/cdctl" README.md LICENSE staging/
+          tar -C staging -czf "dist/$ARCHIVE" cdctl README.md LICENSE
+          (cd dist && sha256sum "$ARCHIVE" > "$ARCHIVE.sha256")
+          cat "dist/$ARCHIVE.sha256"
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+          {
+            echo "### cdctl linux amd64"
+            echo '```'
+            cat "dist/$ARCHIVE.sha256"
+            ls -lh "dist/$ARCHIVE"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cdctl-linux-amd64
+          path: dist/*
+          if-no-files-found: error
+
+  github-release:
+    name: publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-linux-amd64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: cdctl-linux-amd64
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
