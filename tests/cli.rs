@@ -2,6 +2,9 @@
 
 mod common;
 
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
 use assert_cmd::Command;
 use common::*;
 use predicates::prelude::*;
@@ -9,7 +12,7 @@ use serde_json::json;
 use wiremock::matchers::{body_partial_json, query_param};
 use wiremock::{MockServer, ResponseTemplate};
 
-const ENV_VARS: [&str; 8] = [
+const ENV_VARS: [&str; 14] = [
     "CDWS_URL",
     "CD_NODE_HOST",
     "CD_NODE_PORT",
@@ -18,14 +21,34 @@ const ENV_VARS: [&str; 8] = [
     "CD_PASSWORD",
     "CDWS_CA_CERT",
     "CDWS_INSECURE",
+    "CDWS_TIMEOUT",
+    "CDCTL_CONFIG",
+    "CDCTL_LOG_DIR",
+    "CDCTL_LOG_LEVEL",
+    "CDCTL_LOG_FORMAT",
+    "CDCTL_LOG_STDERR",
 ];
 
-/// `cdctl` s vyčištěným prostředím (bez připojení).
+/// Sdílený adresář pro testy, které logy nezkoumají (uvnitř target/tmp).
+fn shared_tmp() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("cli-shared");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("empty.toml"), "").unwrap();
+        d
+    })
+}
+
+/// `cdctl` s vyčištěným prostředím: prázdná konfigurace, logy do target/tmp
+/// (testy nikdy nesahají na /etc/cdctl ani /var/log).
 fn cdctl() -> Command {
     let mut cmd = Command::cargo_bin("cdctl").unwrap();
     for v in ENV_VARS {
         cmd.env_remove(v);
     }
+    cmd.env("CDCTL_CONFIG", shared_tmp().join("empty.toml"))
+        .env("CDCTL_LOG_DIR", shared_tmp().join("logs"));
     cmd
 }
 
@@ -37,6 +60,47 @@ fn cdctl_for(server: &MockServer) -> Command {
         .env("CD_USER", USER)
         .env("CD_PASSWORD", PASSWORD);
     cmd
+}
+
+/// `cdctl` řízený jen konfiguračním souborem (žádné env pro připojení ani log).
+fn cdctl_with_config(config: &Path) -> Command {
+    let mut cmd = cdctl();
+    cmd.env("CDCTL_CONFIG", config).env_remove("CDCTL_LOG_DIR");
+    cmd
+}
+
+/// Zapíše konfigurační soubor do `dir` a vrátí jeho cestu.
+fn write_config(dir: &Path, body: &str) -> PathBuf {
+    let p = dir.join("config.toml");
+    std::fs::write(&p, body).unwrap();
+    p
+}
+
+/// Konfigurace připojení na mock server + log do `<dir>/logs`.
+fn config_for(server: &MockServer, dir: &Path, log_extra: &str) -> PathBuf {
+    let logs = dir.join("logs");
+    write_config(
+        dir,
+        &format!(
+            "[connection]\nurl = \"{}\"\nnode_host = \"{NODE}\"\nuser = \"{USER}\"\npassword = \"{PASSWORD}\"\n\n[log]\ndir = '{}'\nrotation = \"never\"\n{log_extra}\n",
+            server.uri(),
+            logs.display()
+        ),
+    )
+}
+
+fn with_args<const N: usize>(mut cmd: Command, args: [&str; N]) -> Command {
+    cmd.args(args);
+    cmd
+}
+
+/// Obsah všech souborů v adresáři logů.
+fn read_logs(dir: &Path) -> String {
+    let mut out = String::new();
+    for e in std::fs::read_dir(dir).unwrap() {
+        out.push_str(&std::fs::read_to_string(e.unwrap().path()).unwrap());
+    }
+    out
 }
 
 /// assert_cmd je blokující – spustíme ho mimo async runtime.
@@ -405,4 +469,380 @@ async fn api_error_exits_one() {
         .await
         .code(1)
         .stderr(predicate::str::contains("500").and(predicate::str::contains("internal")));
+}
+
+// ------------------------------------------------------------------ config + logging
+
+#[tokio::test(flavor = "multi_thread")]
+async fn config_file_drives_connection_and_logging_without_leaking_secrets() {
+    let server = MockServer::start().await;
+    mount_signon_and_signout(&server).await;
+    authed("GET", "version", JWT)
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "version": "6.4.0" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    // trace = nejpodrobnější úroveň, i tak nesmí v logu být heslo ani tokeny
+    let cfg = config_for(&server, tmp.path(), "level = \"trace\"");
+    run(with_args(cdctl_with_config(&cfg), ["version"]))
+        .await
+        .success();
+
+    let log = read_logs(&tmp.path().join("logs"));
+    for needle in [
+        "cdctl started",
+        "version",
+        "signing on to Connect:Direct",
+        "signed on",
+        "signed out",
+        "cdctl finished",
+        "exit_code=0",
+        "run=",
+    ] {
+        assert!(log.contains(needle), "log is missing `{needle}`:\n{log}");
+    }
+    for secret in [
+        PASSWORD,
+        JWT,
+        CSRF,
+        basic_auth().trim_start_matches("Basic "),
+    ] {
+        assert!(!log.contains(secret), "log leaks `{secret}`:\n{log}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transfer_is_logged_as_audit_trail() {
+    let server = MockServer::start().await;
+    mount_signon_and_signout(&server).await;
+    authed("POST", "processcontrolcriterias", JWT)
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{ "processNumber": 126 }])))
+        .mount(&server)
+        .await;
+    authed("GET", "selectstatistics", JWT)
+        .respond_with(ResponseTemplate::new(200).set_body_json(stats_with_end(126, "0")))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = config_for(&server, tmp.path(), "");
+    run(with_args(
+        cdctl_with_config(&cfg),
+        [
+            "send",
+            "--snode",
+            "PARTNER01",
+            "--from",
+            "/out/pay.csv",
+            "--to",
+            "/in/pay.csv",
+            "--name",
+            "PAYOUT",
+            "--wait",
+        ],
+    ))
+    .await
+    .success();
+
+    let log = read_logs(&tmp.path().join("logs"));
+    for needle in [
+        "file transfer requested",
+        "PARTNER01",
+        "/out/pay.csv",
+        "/in/pay.csv",
+        "submitting process",
+        "PAYOUT PROCESS",
+        "process submitted",
+        "process_number=126",
+        "waiting for process to finish",
+        "process finished OK",
+    ] {
+        assert!(log.contains(needle), "log is missing `{needle}`:\n{log}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failures_are_logged() {
+    let server = MockServer::start().await;
+    signon_mock(JWT, CSRF).mount(&server).await;
+    authed("GET", "version", JWT)
+        .respond_with(ResponseTemplate::new(500).set_body_string("internal"))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = config_for(&server, tmp.path(), "");
+    run(with_args(cdctl_with_config(&cfg), ["version"]))
+        .await
+        .code(1);
+
+    let log = read_logs(&tmp.path().join("logs"));
+    assert!(
+        log.contains("WARN") && log.contains("CDWS returned an error"),
+        "{log}"
+    );
+    assert!(log.contains("status=500"), "{log}");
+    assert!(
+        log.contains("ERROR") && log.contains("cdctl failed"),
+        "{log}"
+    );
+    assert!(log.contains("exit_code=1"), "{log}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn json_log_format_produces_json_lines() {
+    let server = MockServer::start().await;
+    mount_signon_and_signout(&server).await;
+    authed("GET", "version", JWT)
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = config_for(&server, tmp.path(), "format = \"json\"");
+    run(with_args(cdctl_with_config(&cfg), ["version"]))
+        .await
+        .success();
+
+    let log = read_logs(&tmp.path().join("logs"));
+    let lines: Vec<serde_json::Value> = log
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON ({e}): {l}")))
+        .collect();
+    assert!(lines.len() >= 4);
+    for l in &lines {
+        assert!(l["timestamp"].is_string() && l["level"].is_string(), "{l}");
+        assert!(l["span"]["run"].is_string(), "missing run id: {l}");
+    }
+    assert!(lines
+        .iter()
+        .any(|l| l["fields"]["message"] == "cdctl started"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn log_level_filters_messages() {
+    let server = MockServer::start().await;
+    mount_signon_and_signout(&server).await;
+    authed("GET", "version", JWT)
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = config_for(&server, tmp.path(), "level = \"warn\"");
+    run(with_args(cdctl_with_config(&cfg), ["version"]))
+        .await
+        .success();
+    let log = read_logs(&tmp.path().join("logs"));
+    assert!(!log.contains("cdctl started"), "{log}");
+    assert!(!log.contains("INFO"), "{log}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flags_and_env_override_config_file() {
+    let server = MockServer::start().await;
+    mount_signon_and_signout(&server).await;
+    authed("GET", "version", JWT)
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = write_config(
+        tmp.path(),
+        &format!(
+            "[connection]\nurl = \"http://127.0.0.1:9\"\nnode_host = \"{NODE}\"\nuser = \"{USER}\"\n[log]\ndir = '{}'\nlevel = \"error\"\n",
+            tmp.path().join("cfg-logs").display()
+        ),
+    );
+    let flag_logs = tmp.path().join("flag-logs");
+    let mut cmd = cdctl_with_config(&cfg);
+    cmd.env("CDWS_URL", server.uri()) // env > soubor
+        .env("CD_PASSWORD", PASSWORD)
+        .arg("--log-dir")
+        .arg(&flag_logs) // přepínač > soubor
+        .args(["--log-level", "info", "version"]);
+    run(cmd).await.success();
+
+    assert!(!tmp.path().join("cfg-logs").exists());
+    assert!(read_logs(&flag_logs).contains("cdctl started"));
+}
+
+#[test]
+fn password_on_command_line_is_masked_in_log() {
+    let tmp = tempfile::tempdir().unwrap();
+    let logs = tmp.path().join("logs");
+    cdctl()
+        .arg("--log-dir")
+        .arg(&logs)
+        .args([
+            "--password",
+            "topsecret",
+            "send",
+            "--snode",
+            "N",
+            "--from",
+            "/a",
+            "--to",
+            "/b",
+            "--dry-run",
+        ])
+        .assert()
+        .success();
+    let log = read_logs(&logs);
+    assert!(log.contains("--password ***"), "{log}");
+    assert!(!log.contains("topsecret"), "{log}");
+}
+
+#[test]
+fn log_stderr_flag_mirrors_log_to_stderr() {
+    cdctl()
+        .args([
+            "--log-stderr",
+            "send",
+            "--snode",
+            "N",
+            "--from",
+            "/a",
+            "--to",
+            "/b",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("cdctl started").and(predicate::str::contains("dry run")));
+}
+
+#[test]
+fn unwritable_explicit_log_dir_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("not-a-dir");
+    std::fs::write(&file, "x").unwrap();
+    cdctl()
+        .arg("--log-dir")
+        .arg(file.join("logs"))
+        .args([
+            "send",
+            "--snode",
+            "N",
+            "--from",
+            "/a",
+            "--to",
+            "/b",
+            "--dry-run",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("cannot write log"));
+}
+
+#[test]
+fn missing_explicit_config_fails() {
+    cdctl()
+        .env("CDCTL_CONFIG", "/definitely/missing/cdctl.toml")
+        .arg("config")
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("does not exist"));
+}
+
+#[test]
+fn invalid_config_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = write_config(tmp.path(), "[log]\nlevle = \"debug\"\n");
+    cdctl_with_config(&cfg)
+        .arg("config")
+        .assert()
+        .code(1)
+        .stderr(
+            predicate::str::contains("invalid config file").and(predicate::str::contains("levle")),
+        );
+}
+
+#[test]
+fn invalid_log_level_fails() {
+    cdctl()
+        .args(["--log-level", "connect_direct=nonsense", "config"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("invalid log level"));
+}
+
+#[test]
+fn config_command_shows_effective_settings_with_masked_password() {
+    let tmp = tempfile::tempdir().unwrap();
+    let logs = tmp.path().join("logs");
+    let cfg = write_config(
+        tmp.path(),
+        &format!(
+            "[connection]\nurl = \"https://cdws:9443\"\nnode_host = \"n1\"\nnode_port = 2363\nuser = \"u\"\npassword = \"hunter2\"\n[log]\ndir = '{}'\nlevel = \"debug\"\nrotation = \"hourly\"\nmax_files = 48\n",
+            logs.display()
+        ),
+    );
+    cdctl_with_config(&cfg)
+        .arg("config")
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("https://cdws:9443")
+                .and(predicate::str::contains("n1:2363"))
+                .and(predicate::str::contains("*** (set)"))
+                .and(predicate::str::contains("hunter2").not())
+                .and(predicate::str::contains(logs.display().to_string()))
+                .and(predicate::str::contains("hourly (keep 48 files)"))
+                .and(predicate::str::contains("debug")),
+        );
+}
+
+#[cfg(unix)]
+#[test]
+fn world_readable_config_with_password_warns() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = write_config(
+        tmp.path(),
+        &format!(
+            "[connection]\npassword = \"x\"\n[log]\ndir = '{}'\n",
+            tmp.path().join("logs").display()
+        ),
+    );
+    std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o644)).unwrap();
+    cdctl_with_config(&cfg)
+        .arg("config")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("chmod 600"));
+    assert!(read_logs(&tmp.path().join("logs")).contains("chmod 600"));
+}
+
+#[test]
+fn connection_error_reports_root_cause() {
+    // port, na kterém nic neposlouchá
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let tmp = tempfile::tempdir().unwrap();
+    let logs = tmp.path().join("logs");
+    cdctl()
+        .env("CDWS_URL", format!("http://127.0.0.1:{port}"))
+        .env("CD_NODE_HOST", NODE)
+        .env("CD_USER", USER)
+        .arg("--log-dir")
+        .arg(&logs)
+        .arg("version")
+        .assert()
+        .code(1)
+        .stderr(
+            predicate::str::contains("error sending request")
+                .and(predicate::str::contains("connect")),
+        );
+    let log = read_logs(&logs);
+    assert!(
+        log.contains("sign-on request failed") && log.contains("connect"),
+        "{log}"
+    );
 }

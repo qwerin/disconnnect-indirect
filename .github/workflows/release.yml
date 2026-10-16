@@ -62,8 +62,8 @@ jobs:
             ARCHIVE="cdctl-${GITHUB_SHA::7}-${TARGET}.tar.gz"
           fi
           mkdir -p staging dist
-          cp "target/$TARGET/release/cdctl" README.md LICENSE staging/
-          tar -C staging -czf "dist/$ARCHIVE" cdctl README.md LICENSE
+          cp "target/$TARGET/release/cdctl" README.md LICENSE config.example.toml staging/
+          tar -C staging -czf "dist/$ARCHIVE" cdctl README.md LICENSE config.example.toml
           (cd dist && sha256sum "$ARCHIVE" > "$ARCHIVE.sha256")
           cat "dist/$ARCHIVE.sha256"
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"

@@ -1,0 +1,32 @@
+# cdctl – ukázková konfigurace
+#
+# Výchozí umístění: /etc/cdctl/config.toml (jiné: --config <soubor> nebo CDCTL_CONFIG).
+# Priorita: přepínač > proměnná prostředí > tento soubor > výchozí hodnota.
+# Všechny položky jsou volitelné. Neznámé klíče jsou chyba (ochrana proti překlepům).
+#
+# Obsahuje-li soubor heslo, nastavte práva: chmod 600 /etc/cdctl/config.toml
+
+[connection]
+url          = "https://cdws.example.com:9443"   # CDWS_URL
+node_host    = "cdnode1.example.com"             # CD_NODE_HOST
+node_port    = 1363                              # CD_NODE_PORT
+protocol     = "TCPIP"                           # CD_PROTOCOL: TCPIP | NONE | TLS1.2 | TLS1.3
+user         = "cduser"                          # CD_USER
+# password   = "..."                             # CD_PASSWORD (raději přes proměnnou prostředí)
+# ca_cert    = "/etc/cdctl/cdws-ca.pem"          # CDWS_CA_CERT
+insecure     = false                             # CDWS_INSECURE – jen pro test!
+timeout_secs = 120                               # CDWS_TIMEOUT
+
+[log]
+# Adresář logů. Výchozí /var/log/cdctl; když do něj nejde zapisovat (běh bez roota),
+# použije se ~/.local/state/cdctl/log. Explicitně nastavený adresář se nenahrazuje – chyba = konec.
+dir       = "/var/log/cdctl"                     # --log-dir, CDCTL_LOG_DIR
+file      = "cdctl.log"                          # s rotací vznikne cdctl.2026-10-16.log
+# error | warn | info | debug | trace, nebo filtr pro jednotlivé moduly:
+#   "connect_direct=debug,info"  – detail HTTP volání knihovny, zbytek info
+#   "trace"                      – včetně těl požadavků a odpovědí
+level     = "info"                               # --log-level, CDCTL_LOG_LEVEL
+format    = "text"                               # text | json   (--log-format, CDCTL_LOG_FORMAT)
+rotation  = "daily"                              # minutely | hourly | daily | never
+max_files = 14                                   # kolik rotovaných souborů ponechat (0 = všechny)
+stderr    = false                                # zároveň logovat na stderr (--log-stderr)

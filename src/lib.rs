@@ -24,7 +24,7 @@ mod models;
 mod process;
 
 pub use client::{CdClient, Config, Credentials};
-pub use error::{Error, Result};
+pub use error::{error_chain, Error, Result};
 pub use models::{
     completion_code, extract_process_number, find_stat_record, DeleteProcess, Protocol, Query,
     SubmitProcess,

@@ -5,9 +5,13 @@ use reqwest::header::{HeaderMap, ACCEPT, AUTHORIZATION, CONTENT_TYPE, SET_COOKIE
 use reqwest::{Method, Response, StatusCode};
 use serde_json::Value;
 use tokio::sync::Mutex;
+use tracing::{debug, error, info, trace, warn};
 
-use crate::error::{Error, Result};
-use crate::models::{find_stat_record, DeleteProcess, Protocol, Query, SignonBody, SubmitProcess};
+use crate::error::{error_chain, Error, Result};
+use crate::models::{
+    completion_code, extract_process_number, find_stat_record, DeleteProcess, Protocol, Query,
+    SignonBody, SubmitProcess,
+};
 
 const API_PREFIX: &str = "/cdwebconsole/svc";
 /// Fixní XSRF hodnota pro sign-on ("checkit" v base64) – viz dokumentace CDWS.
@@ -132,6 +136,19 @@ impl CdClient {
             builder = builder.identity(id);
         }
 
+        if cfg.accept_invalid_certs {
+            warn!(base_url = %cfg.base_url, "TLS certificate verification is DISABLED");
+        }
+        debug!(
+            base_url = %cfg.base_url,
+            node = %cfg.node_host,
+            port = cfg.node_port,
+            protocol = cfg.protocol.as_str(),
+            extra_ca_certs = cfg.extra_root_certs_pem.len(),
+            timeout_s = cfg.timeout.as_secs(),
+            "CDWS client created"
+        );
+
         Ok(Self {
             http: builder.build()?,
             cfg,
@@ -165,7 +182,7 @@ impl CdClient {
             protocol: self.cfg.protocol.as_str(),
         };
 
-        let mut req = self
+        let req = self
             .http
             .post(self.url("signon"))
             .header(CONTENT_TYPE, "application/json")
@@ -173,28 +190,67 @@ impl CdClient {
             .header(XSRF_HEADER, SIGNON_XSRF)
             .json(&body);
 
-        req = match &self.cfg.credentials {
+        let (req, auth_kind, user) = match &self.cfg.credentials {
             Credentials::Basic { user, password } => {
                 let token = B64.encode(format!("{user}:{password}"));
-                req.header(AUTHORIZATION, format!("Basic {token}"))
+                (
+                    req.header(AUTHORIZATION, format!("Basic {token}")),
+                    "basic",
+                    user.as_str(),
+                )
             }
-            Credentials::Certificate { .. } => req.header("CertificateAuthentication", "true"),
+            Credentials::Certificate { .. } => (
+                req.header("CertificateAuthentication", "true"),
+                "certificate",
+                "-",
+            ),
         };
 
-        let resp = req.send().await?;
+        info!(
+            node = %self.cfg.node_host,
+            port = self.cfg.node_port,
+            protocol = self.cfg.protocol.as_str(),
+            auth = auth_kind,
+            user,
+            "signing on to Connect:Direct"
+        );
+        let started = Instant::now();
+
+        let resp = req.send().await.inspect_err(|e| {
+            error!(error = %error_chain(e), url = %self.url("signon"), "sign-on request failed");
+        })?;
         let status = resp.status();
         let headers = resp.headers().clone();
         let text = resp.text().await?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
         if !status.is_success() {
+            error!(
+                status = status.as_u16(),
+                elapsed_ms,
+                body = %truncate(&text, 500),
+                "sign-on rejected"
+            );
             return Err(Error::Api { status, body: text });
         }
 
-        let authorization =
-            header_str(&headers, "authorization").ok_or(Error::MissingHeader("Authorization"))?;
+        let authorization = header_str(&headers, "authorization").ok_or_else(|| {
+            error!("sign-on response has no Authorization header");
+            Error::MissingHeader("Authorization")
+        })?;
         let xsrf = header_str(&headers, "_csrf")
             .or_else(|| header_str(&headers, XSRF_HEADER))
-            .or_else(|| xsrf_from_cookies(&headers))
-            .ok_or(Error::MissingHeader("_csrf"))?;
+            .or_else(|| {
+                let v = xsrf_from_cookies(&headers);
+                if v.is_some() {
+                    debug!("XSRF token taken from XSRF-TOKEN cookie");
+                }
+                v
+            })
+            .ok_or_else(|| {
+                error!("sign-on response has no _csrf header or XSRF-TOKEN cookie");
+                Error::MissingHeader("_csrf")
+            })?;
+        info!(elapsed_ms, "signed on");
 
         Ok((
             Session {
@@ -227,7 +283,10 @@ impl CdClient {
                 .header(ACCEPT, "application/json")
                 .send()
                 .await?;
-            check(resp).await?;
+            check(resp)
+                .await
+                .inspect_err(|e| warn!(error = %e, "sign-out failed"))?;
+            info!("signed out");
         }
         Ok(())
     }
@@ -246,6 +305,11 @@ impl CdClient {
         let mut retried = false;
         loop {
             let s = self.current_session().await?;
+            debug!(%method, path, query = ?query.params, retry = retried, "request");
+            if let Some(b) = body {
+                trace!(%method, path, body = %b, "request body");
+            }
+            let started = Instant::now();
             let mut req = self
                 .http
                 .request(method.clone(), self.url(path))
@@ -259,13 +323,34 @@ impl CdClient {
                 req = req.json(b);
             }
 
-            let resp = req.send().await?;
-            if resp.status() == StatusCode::UNAUTHORIZED && self.cfg.auto_resignon && !retried {
+            let resp = req.send().await.inspect_err(|e| {
+                error!(%method, path, error = %error_chain(e), "request failed");
+            })?;
+            let status = resp.status();
+            if status == StatusCode::UNAUTHORIZED && self.cfg.auto_resignon && !retried {
+                warn!(%method, path, "session rejected (401), signing on again");
                 retried = true;
                 *self.session.lock().await = None;
                 continue;
             }
-            return check(resp).await;
+            let result = check(resp).await;
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            match &result {
+                Ok(v) => {
+                    debug!(%method, path, status = status.as_u16(), elapsed_ms, "response");
+                    trace!(%method, path, body = %v, "response body");
+                }
+                Err(Error::Api { status, body }) => warn!(
+                    %method,
+                    path,
+                    status = status.as_u16(),
+                    elapsed_ms,
+                    body = %truncate(body, 500),
+                    "CDWS returned an error"
+                ),
+                Err(e) => error!(%method, path, error = %error_chain(e), "reading response failed"),
+            }
+            return result;
         }
     }
 
@@ -279,14 +364,27 @@ impl CdClient {
     /// Submit procesu. Číslo procesu z odpovědi získáte přes
     /// [`crate::extract_process_number`].
     pub async fn submit_process(&self, p: &SubmitProcess) -> Result<Value> {
+        info!(
+            process = %describe_process(&p.process_file),
+            snode = %p.secondary_node,
+            hold = %p.hold,
+            max_delay = %p.max_delay,
+            "submitting process"
+        );
         let body = serde_json::to_value(p)?;
-        self.call(
-            Method::POST,
-            "processcontrolcriterias",
-            &Query::new(),
-            Some(&body),
-        )
-        .await
+        let resp = self
+            .call(
+                Method::POST,
+                "processcontrolcriterias",
+                &Query::new(),
+                Some(&body),
+            )
+            .await?;
+        match extract_process_number(&resp) {
+            Some(n) => info!(process_number = n, "process submitted"),
+            None => warn!("process submitted, but no process number found in response"),
+        }
+        Ok(resp)
     }
 
     /// Zkratka: submit procesu zadaného textem.
@@ -307,6 +405,14 @@ impl CdClient {
                 "delete needs processName, processNumber, submitter or secondaryNode".into(),
             ));
         }
+        info!(
+            process_name = %d.process_name,
+            process_number = %d.process_number,
+            snode = %d.secondary_node,
+            submitter = %d.submitter,
+            force = %d.force,
+            "deleting process"
+        );
         let body = serde_json::to_value(d)?;
         self.call(
             Method::DELETE,
@@ -333,17 +439,47 @@ impl CdClient {
         poll: Duration,
         timeout: Duration,
     ) -> Result<Value> {
+        info!(
+            process_number,
+            poll_ms = poll.as_millis() as u64,
+            timeout_s = timeout.as_secs(),
+            "waiting for process to finish"
+        );
         let start = Instant::now();
+        let mut polls = 0u32;
         loop {
+            polls += 1;
             let stats = self
                 .select_statistics(&Query::process_number(process_number))
                 .await?;
             if let Some(rec) = find_stat_record(&stats, "PRED") {
+                let ccode = completion_code(rec);
+                let elapsed_s = start.elapsed().as_secs();
+                match ccode.as_deref() {
+                    Some("0") => {
+                        info!(
+                            process_number,
+                            ccode = "0",
+                            elapsed_s,
+                            polls,
+                            "process finished OK"
+                        )
+                    }
+                    other => warn!(
+                        process_number,
+                        ccode = other.unwrap_or("?"),
+                        elapsed_s,
+                        polls,
+                        "process finished with non-zero completion code"
+                    ),
+                }
                 return Ok(rec.clone());
             }
             if start.elapsed() >= timeout {
+                error!(process_number, polls, "timed out waiting for process");
                 return Err(Error::Timeout(process_number));
             }
+            debug!(process_number, polls, "process still running");
             tokio::time::sleep(poll).await;
         }
     }
@@ -357,6 +493,24 @@ fn contains_pem_block(pem: &[u8], kind: &str) -> bool {
     let text = String::from_utf8_lossy(pem);
     text.lines()
         .any(|l| l.starts_with("-----BEGIN ") && l.contains(kind) && l.ends_with("-----"))
+}
+
+/// Zkrátí text pro log (na hranici znaku).
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… ({} bytes total)", &s[..end], s.len())
+}
+
+/// Krátký popis procesu pro log: první řádek textu, nebo cesta k .cdp souboru.
+fn describe_process(process_file: &str) -> String {
+    let first = process_file.lines().next().unwrap_or("").trim();
+    truncate(first, 120)
 }
 
 fn header_str(h: &HeaderMap, name: &str) -> Option<String> {
