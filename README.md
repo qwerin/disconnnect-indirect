@@ -152,6 +152,23 @@ Co klient a CLI hlídají:
 Na ověření proti reálnému C:D zbývá: zda C:D rozbaluje symbolické proměnné (`&VAR`) i uvnitř uvozovek
 v cestě souboru.
 
+## Závislosti
+
+Pravidla jsou v [`deny.toml`](deny.toml) a hlídá je `cargo deny check` v CI (při každém pushi a jednou týdně):
+žádné známé zranitelnosti (RustSec) ani neudržované či stažené (yanked) crates, jen permisivní licence,
+jen crates.io (žádné git závislosti), žádný OpenSSL / native-tls – TLS je čistě `rustls`
+(kryptografie `aws-lc-rs`, kořenové certifikáty ze systému přes `rustls-platform-verifier`).
+
+GitHub Actions jsou připnuté na konkrétní commit (SHA), aby změna tagu u cizí akce nemohla podvrhnout build ani release.
+Aktualizace crates i akcí navrhuje Dependabot (`.github/dependabot.yml`).
+
+Release obsahuje `THIRD-PARTY-LICENSES.txt` s licencemi všech crates zkompilovaných do binárky
+(generuje [`scripts/third_party_licenses.py`](scripts/third_party_licenses.py)).
+
+**Pozor při nasazení:** od verze 0.3.1 se serverový certifikát CDWS ověřuje proti **systémovému** úložišti
+certifikátů (dřív proti certifikátům zabudovaným v binárce). Firemní CA nainstalovaná v systému tak funguje
+automaticky; na minimálním systému bez balíčku `ca-certificates` je potřeba `ca_cert` / `--ca-cert`.
+
 ## Poznámky k API
 
 - Sign-on: `POST /cdwebconsole/svc/signon` s `Authorization: Basic …` a fixním

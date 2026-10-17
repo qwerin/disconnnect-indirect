@@ -137,7 +137,7 @@ impl CdClient {
             .redirect(reqwest::redirect::Policy::none())
             .cookie_store(true)
             .timeout(cfg.timeout)
-            .danger_accept_invalid_certs(cfg.accept_invalid_certs);
+            .tls_danger_accept_invalid_certs(cfg.accept_invalid_certs);
 
         for pem in &cfg.extra_root_certs_pem {
             if !contains_pem_block(pem, "CERTIFICATE") {
@@ -147,7 +147,8 @@ impl CdClient {
             }
             let cert = reqwest::Certificate::from_pem(pem)
                 .map_err(|e| Error::Config(format!("invalid CA certificate: {e}")))?;
-            builder = builder.add_root_certificate(cert);
+            // přidá se k systémovým kořenovým certifikátům (rustls-platform-verifier)
+            builder = builder.tls_certs_merge([cert]);
         }
 
         if let Credentials::Certificate { identity_pem } = &cfg.credentials {

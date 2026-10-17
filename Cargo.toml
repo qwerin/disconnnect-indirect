@@ -1,6 +1,6 @@
 [package]
 name = "connect-direct"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.88"
 description = "Async Rust klient pro IBM Sterling Connect:Direct Web Services (CDWS) REST API"
@@ -31,15 +31,15 @@ cli = [
 ]
 
 [dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "cookies", "rustls"] }
 tokio = { version = "1", features = ["sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
+base64 = "0.23"
 thiserror = "2"
 tracing = "0.1"
 clap = { version = "4", features = ["derive", "env"], optional = true }
-toml = { version = "0.9", optional = true }
+toml = { version = "1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
 tracing-appender = { version = "0.2", optional = true }
 
@@ -48,7 +48,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 wiremock = "0.6"
 assert_cmd = "2"
 predicates = "3"
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 tempfile = "3"
 proptest = "1"
 

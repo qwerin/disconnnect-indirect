@@ -145,7 +145,7 @@ async fn certificate_auth_sends_flag_instead_of_basic_auth() {
         .await;
 
     let key = rcgen::generate_simple_self_signed(vec!["client.test".into()]).unwrap();
-    let pem = format!("{}{}", key.cert.pem(), key.key_pair.serialize_pem());
+    let pem = format!("{}{}", key.cert.pem(), key.signing_key.serialize_pem());
 
     let mut cfg = config(&server);
     cfg.credentials = Credentials::Certificate {
@@ -671,4 +671,23 @@ fn dangerous_configs_are_rejected() {
     let mut cfg = Config::new("https://cdws:9443", NODE, USER, PASSWORD);
     cfg.max_response_bytes = 0;
     assert!(matches!(CdClient::new(cfg), Err(Error::Config(_))));
+}
+
+#[tokio::test]
+async fn long_error_bodies_are_shortened_in_messages_only() {
+    let server = MockServer::start().await;
+    signon_mock(JWT, CSRF).mount(&server).await;
+    let body = format!("<html>{}</html>", "x".repeat(10_000));
+    authed("GET", "version", JWT)
+        .respond_with(ResponseTemplate::new(422).set_body_string(body.clone()))
+        .mount(&server)
+        .await;
+
+    let err = client(&server).version().await.unwrap_err();
+    assert!(err.to_string().len() < 400, "{}", err.to_string().len());
+    assert!(err.to_string().contains("bytes total"));
+    match err {
+        Error::Api { body: full, .. } => assert_eq!(full, body),
+        other => panic!("{other:?}"),
+    }
 }

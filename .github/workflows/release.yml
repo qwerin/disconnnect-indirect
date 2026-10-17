@@ -20,16 +20,19 @@ jobs:
     outputs:
       archive: ${{ steps.package.outputs.archive }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: stable
           targets: ${{ env.TARGET }}
 
       - name: install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ env.TARGET }}
 
@@ -53,6 +56,9 @@ jobs:
           "$BIN" --version
           "$BIN" send --snode SMOKE --from /a --to /b --dry-run | grep -q '^PEND$'
 
+      - name: third-party licenses
+        run: python3 scripts/third_party_licenses.py --target "$TARGET" -o THIRD-PARTY-LICENSES.txt
+
       - name: package
         id: package
         run: |
@@ -62,8 +68,8 @@ jobs:
             ARCHIVE="cdctl-${GITHUB_SHA::7}-${TARGET}.tar.gz"
           fi
           mkdir -p staging dist
-          cp "target/$TARGET/release/cdctl" README.md LICENSE config.example.toml staging/
-          tar -C staging -czf "dist/$ARCHIVE" cdctl README.md LICENSE config.example.toml
+          cp "target/$TARGET/release/cdctl" README.md LICENSE THIRD-PARTY-LICENSES.txt config.example.toml staging/
+          tar -C staging -czf "dist/$ARCHIVE" cdctl README.md LICENSE THIRD-PARTY-LICENSES.txt config.example.toml
           (cd dist && sha256sum "$ARCHIVE" > "$ARCHIVE.sha256")
           cat "dist/$ARCHIVE.sha256"
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
@@ -75,7 +81,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cdctl-linux-amd64
           path: dist/*
@@ -89,11 +95,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cdctl-linux-amd64
           path: dist
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: dist/*
           generate_release_notes: true

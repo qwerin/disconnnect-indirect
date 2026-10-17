@@ -9,7 +9,8 @@ pub enum Error {
     Http(#[from] reqwest::Error),
 
     /// CDWS odpověděl ne-2xx stavem.
-    #[error("CDWS returned {status}: {body}")]
+    /// `body` obsahuje celé tělo odpovědi; text chyby ho zkracuje na 300 bajtů.
+    #[error("CDWS returned {status}: {}", crate::text::truncate_sanitized(.body, 300))]
     Api { status: StatusCode, body: String },
 
     /// Sign-on prošel, ale v odpovědi chybí očekávaná hlavička.
