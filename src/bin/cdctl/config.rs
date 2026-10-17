@@ -30,6 +30,8 @@ pub struct ConnectionSection {
     pub ca_cert: Option<PathBuf>,
     pub insecure: Option<bool>,
     pub timeout_secs: Option<u64>,
+    /// Limit velikosti odpovědi serveru v MiB (výchozí 64).
+    pub max_response_mb: Option<u64>,
 }
 
 /// Sekce `[log]`.
@@ -84,6 +86,80 @@ impl fmt::Display for Rotation {
 pub const DEFAULT_LOG_FILE: &str = "cdctl.log";
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 pub const DEFAULT_MAX_LOG_FILES: usize = 14;
+pub const DEFAULT_MAX_RESPONSE_MB: u64 = 64;
+/// Limit pro konfigurační soubor, .cdp soubor i PEM certifikát (ochrana proti /dev/zero apod.).
+pub const MAX_INPUT_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Přečte soubor nejvýše do `max` bajtů; větší (nebo nekonečný, např. /dev/zero) odmítne.
+pub fn read_limited(path: &Path, max: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if file.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+        return Err(format!("cannot read {}: is a directory", path.display()));
+    }
+    let mut buf = Vec::new();
+    file.take(max + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if buf.len() as u64 > max {
+        return Err(format!(
+            "{} is too large (limit {max} bytes)",
+            path.display()
+        ));
+    }
+    Ok(buf)
+}
+
+/// Jako [`read_limited`], navíc vyžaduje platné UTF-8.
+pub fn read_limited_string(path: &Path, max: u64) -> Result<String, String> {
+    String::from_utf8(read_limited(path, max)?)
+        .map_err(|_| format!("{} is not valid UTF-8 text", path.display()))
+}
+
+/// Název souboru logu: bez cesty, ne prázdný, ne skrytý, bez řídicích znaků.
+pub fn validate_log_file_name(name: &str) -> Result<(), String> {
+    let bad = name.is_empty()
+        || name.len() > 200
+        || name.starts_with('.')
+        || name.contains(['/', '\\', ':'])
+        || name.chars().any(connect_direct::is_dangerous_char);
+    if bad {
+        Err(format!(
+            "invalid log file name `{}`: must be a plain file name like `cdctl.log` (no path, not starting with a dot)",
+            connect_direct::sanitize(name)
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Kontrola hodnot, které parser přijme, ale nedávají smysl.
+pub fn validate(c: &FileConfig) -> Result<(), String> {
+    if c.connection.node_port == Some(0) {
+        return Err("[connection] node_port must be 1-65535".into());
+    }
+    if c.connection.timeout_secs == Some(0) {
+        return Err("[connection] timeout_secs must be at least 1".into());
+    }
+    if let Some(mb) = c.connection.max_response_mb {
+        if mb == 0 || mb > 4096 {
+            return Err("[connection] max_response_mb must be 1-4096".into());
+        }
+    }
+    if let Some(f) = &c.log.file {
+        validate_log_file_name(f).map_err(|e| format!("[log] file: {e}"))?;
+    }
+    if let Some(l) = &c.log.level {
+        if l.trim().is_empty() {
+            return Err("[log] level must not be empty".into());
+        }
+    }
+    if c.log.dir.as_ref().is_some_and(|d| d.as_os_str().is_empty()) {
+        return Err("[log] dir must not be empty".into());
+    }
+    Ok(())
+}
 
 /// Výchozí cesta ke konfiguraci: `/etc/cdctl/config.toml` (Windows: `%ProgramData%\cdctl\config.toml`).
 pub fn default_config_path() -> PathBuf {
@@ -150,9 +226,10 @@ pub fn load(explicit: Option<&Path>) -> Result<Loaded, String> {
             Ok(Loaded::default())
         };
     }
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("cannot read config file {}: {e}", path.display()))?;
+    let text = read_limited_string(&path, MAX_INPUT_FILE_BYTES)
+        .map_err(|e| format!("config file: {e}"))?;
     let cfg = parse(&text).map_err(|e| format!("invalid config file {}: {e}", path.display()))?;
+    validate(&cfg).map_err(|e| format!("invalid config file {}: {e}", path.display()))?;
     let permission_warning = if cfg.connection.password.is_some() {
         insecure_permissions(&path)
     } else {
@@ -292,5 +369,64 @@ mod tests {
             );
         }
         assert!(default_log_dir().ends_with("log") || default_log_dir().ends_with("cdctl"));
+    }
+
+    #[test]
+    fn rejects_nonsense_values() {
+        for bad in [
+            "[connection]\nnode_port = 0\n",
+            "[connection]\ntimeout_secs = 0\n",
+            "[connection]\nmax_response_mb = 0\n",
+            "[log]\nfile = \"../../escaped.log\"\n",
+            "[log]\nfile = \"/\"\n",
+            "[log]\nfile = \"\"\n",
+            "[log]\nfile = \".hidden\"\n",
+            "[log]\nfile = 'C:\\x.log'\n",
+            "[log]\nlevel = \" \"\n",
+            "[log]\ndir = \"\"\n",
+        ] {
+            let c = parse(bad).unwrap();
+            assert!(validate(&c).is_err(), "{bad:?} must be rejected");
+        }
+        assert!(validate(&parse(FULL).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn read_limited_rejects_large_and_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big");
+        std::fs::write(&p, vec![b'a'; 101]).unwrap();
+        assert!(read_limited(&p, 100).unwrap_err().contains("too large"));
+        assert_eq!(read_limited(&p, 101).unwrap().len(), 101);
+        assert!(read_limited(dir.path(), 100).is_err());
+        let bin = dir.path().join("bin");
+        std::fs::write(&bin, [0xff, 0xfe]).unwrap();
+        assert!(read_limited_string(&bin, 100)
+            .unwrap_err()
+            .contains("UTF-8"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_limited_survives_dev_zero() {
+        let err = read_limited(Path::new("/dev/zero"), 1024).unwrap_err();
+        assert!(err.contains("too large"));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_config_parser_never_panics(text in proptest::prelude::any::<String>()) {
+            if let Ok(c) = parse(&text) {
+                let _ = validate(&c);
+            }
+        }
+
+        #[test]
+        fn prop_valid_log_file_names_stay_in_dir(name in proptest::prelude::any::<String>()) {
+            if validate_log_file_name(&name).is_ok() {
+                let p = Path::new("/var/log/cdctl").join(&name);
+                proptest::prop_assert_eq!(p.parent(), Some(Path::new("/var/log/cdctl")));
+            }
+        }
     }
 }

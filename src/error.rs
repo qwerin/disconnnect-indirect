@@ -2,6 +2,7 @@ use reqwest::StatusCode;
 
 /// Chyby, které může vrátit klient Connect:Direct.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// Síťová / TLS / HTTP chyba na úrovni reqwest.
     #[error("HTTP error: {0}")]
@@ -22,6 +23,14 @@ pub enum Error {
     /// Neplatný vstup pro generování procesu (jméno, cesta, ...).
     #[error("invalid process definition: {0}")]
     InvalidProcess(String),
+
+    /// Nepovolený vstup (cesta API mimo `/cdwebconsole/svc/`, příliš velký token, …).
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
+    /// Odpověď serveru překročila limit `Config::max_response_bytes`.
+    #[error("response exceeds the limit of {limit} bytes")]
+    ResponseTooLarge { limit: u64 },
 
     /// Proces nedoběhl v zadaném čase.
     #[error("timed out waiting for process {0} to finish")]

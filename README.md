@@ -129,6 +129,29 @@ cdctl config      # výsledná konfigurace a cesta k logu (heslo se nevypisuje)
 Knihovna sama loguje přes [`tracing`](https://crates.io/crates/tracing) (target `connect_direct`);
 v aplikaci stačí nastavit libovolný `tracing` subscriber.
 
+## Bezpečnost a odolnost
+
+Projekt má vlastního **záškodníka** – [`scripts/saboteur/run.sh`](scripts/saboteur/run.sh) spouští 37 útoků na `cdctl`
+(škodlivé argumenty, konfigurace, soubory jako `/dev/zero` a zlý CDWS server, který přesměrovává, posílá obří
+odpovědi, padělá řádky logu nebo escape sekvence terminálu). Běží v CI při každém pushi, spolu s property testy
+(proptest, 20 000 náhodných vstupů na test).
+
+Co klient a CLI hlídají:
+
+- **žádná přesměrování** – session token (`X-XSRF-TOKEN`) nikdy neodejde na jiný server
+- **cesty API** jen pod `/cdwebconsole/svc/` (`../`, `%2e%2e`, `?`, `#` se odmítnou)
+- **limity velikosti**: odpověď serveru (výchozí 64 MiB, `max_response_mb`), tokeny 16 KiB,
+  konfigurační soubor, `.cdp` soubor a certifikát 1 MiB
+- **generátor procesů** nedovolí změnit strukturu procesu: odmítá řídicí znaky a bidi znaky v cestách,
+  SYSOPTS musí být jeden token nebo korektně uzavřený řetězec
+- **logy a terminál**: řídicí znaky z dat (nové řádky, ESC, bidi) se escapují – nejde padělat řádky logu
+  ani poslat escape sekvence do terminálu; hesla a tokeny se do logu nezapisují
+- **konfigurace**: neznámé klíče, nulový timeout/port a název souboru logu s cestou se odmítnou
+- zavřená roura (`cdctl stats | head`) není pád
+
+Na ověření proti reálnému C:D zbývá: zda C:D rozbaluje symbolické proměnné (`&VAR`) i uvnitř uvozovek
+v cestě souboru.
+
 ## Poznámky k API
 
 - Sign-on: `POST /cdwebconsole/svc/signon` s `Authorization: Basic …` a fixním
@@ -150,6 +173,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features          # unit + integrační + CLI + doc testy
 cargo test --no-default-features   # jen knihovna, bez CLI
 ```
+
+Property testy (`prop_*`, proptest) generují náhodné vstupy – v CI 20 000 na test.
 
 Testy nepotřebují reálný Connect:Direct – běží proti mock CDWS serveru ([wiremock](https://crates.io/crates/wiremock)):
 

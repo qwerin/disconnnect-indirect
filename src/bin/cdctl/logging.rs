@@ -1,5 +1,6 @@
 //! Logování `cdctl` do souboru (výchozí `/var/log/cdctl/cdctl.log`) s rotací.
 
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use tracing::Subscriber;
@@ -59,10 +60,17 @@ pub fn init(s: &LogSettings) -> Result<LogHandle, String> {
     let (appender, dir, fell_back_from) = open_appender(s)?;
     let (writer, guard) = tracing_appender::non_blocking(appender);
 
-    let file_layer = make_layer(writer, s.format);
-    let stderr_layer = s
-        .stderr
-        .then(|| make_layer(std::io::stderr, LogFormat::Text));
+    // Textový log chrání proti padělání řádků Sanitizing writer; JSON escapuje sám.
+    let file_layer = match s.format {
+        LogFormat::Text => make_layer(Sanitizing(writer), LogFormat::Text),
+        LogFormat::Json => make_layer(writer, LogFormat::Json),
+    };
+    let stderr_layer = s.stderr.then(|| {
+        make_layer(
+            Sanitizing(std::io::stderr as fn() -> io::Stderr),
+            LogFormat::Text,
+        )
+    });
 
     tracing_subscriber::registry()
         .with(filter)
@@ -134,6 +142,42 @@ fn split_file_name(name: &str) -> (&str, Option<&str>) {
     match name.rsplit_once('.') {
         Some((p, s)) if !p.is_empty() && !s.is_empty() => (p, Some(s)),
         _ => (name, None),
+    }
+}
+
+/// MakeWriter, který v každé události zneškodní řídicí znaky (nové řádky, ESC, bidi…)
+/// kromě koncového `\n` – data ze serveru ani z argumentů tak nemohou padělat řádky logu
+/// ani poslat escape sekvence do terminálu.
+pub struct Sanitizing<M>(pub M);
+
+impl<'a, M: MakeWriter<'a>> MakeWriter<'a> for Sanitizing<M> {
+    type Writer = SanitizingWriter<M::Writer>;
+    fn make_writer(&'a self) -> Self::Writer {
+        SanitizingWriter(self.0.make_writer())
+    }
+}
+
+pub struct SanitizingWriter<W>(W);
+
+impl<W: Write> Write for SanitizingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let text = String::from_utf8_lossy(buf);
+        let (body, newline) = match text.strip_suffix('\n') {
+            Some(b) => (b, "\n"),
+            None => (&*text, ""),
+        };
+        if body.chars().any(connect_direct::is_dangerous_char) {
+            let mut clean = connect_direct::sanitize(body);
+            clean.push_str(newline);
+            self.0.write_all(clean.as_bytes())?;
+        } else {
+            self.0.write_all(buf)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
     }
 }
 
@@ -246,5 +290,34 @@ mod tests {
             .collect();
         assert_eq!(names.len(), 1, "{names:?}");
         assert!(names[0].starts_with("cdctl.20") && names[0].ends_with(".log"));
+    }
+
+    #[test]
+    fn sanitizing_writer_neutralises_forged_lines() {
+        let mut out = Vec::new();
+        {
+            let mut w = SanitizingWriter(&mut out);
+            w.write_all(b"INFO ok body=boom\nINFO forged\x1b[2J\n")
+                .unwrap();
+            w.write_all(b"INFO clean line\n").unwrap();
+        }
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(text.contains("boom\\nINFO forged\\u{1b}[2J"));
+        assert!(!text.contains('\u{1b}'));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_sanitizing_writer_emits_single_line(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..300)) {
+            let mut input = bytes.clone();
+            input.push(b'\n');
+            let mut out = Vec::new();
+            SanitizingWriter(&mut out).write_all(&input).unwrap();
+            let text = String::from_utf8_lossy(&out);
+            proptest::prop_assert_eq!(text.matches('\n').count(), 1);
+            proptest::prop_assert!(text.ends_with('\n'));
+            proptest::prop_assert!(!text.trim_end_matches('\n').chars().any(connect_direct::is_dangerous_char));
+        }
     }
 }

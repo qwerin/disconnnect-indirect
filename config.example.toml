@@ -15,7 +15,8 @@ user         = "cduser"                          # CD_USER
 # password   = "..."                             # CD_PASSWORD (raději přes proměnnou prostředí)
 # ca_cert    = "/etc/cdctl/cdws-ca.pem"          # CDWS_CA_CERT
 insecure     = false                             # CDWS_INSECURE – jen pro test!
-timeout_secs = 120                               # CDWS_TIMEOUT
+timeout_secs = 120                               # CDWS_TIMEOUT (min. 1)
+max_response_mb = 64                             # limit velikosti odpovědi serveru (ochrana paměti)
 
 [log]
 # Adresář logů. Výchozí /var/log/cdctl; když do něj nejde zapisovat (běh bez roota),

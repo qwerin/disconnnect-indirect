@@ -76,6 +76,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-features --locked
 
+  saboteur:
+    name: saboteur (adversarial inputs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --bin cdctl
+      - name: 37 attacks on CLI inputs, config and a malicious CDWS server
+        run: scripts/saboteur/run.sh target/debug/cdctl
+
+  property-tests:
+    name: property tests (20k cases)
+    runs-on: ubuntu-latest
+    env:
+      PROPTEST_CASES: 20000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release --all-features --locked prop_
+
   docs:
     name: docs
     runs-on: ubuntu-latest

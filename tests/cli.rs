@@ -846,3 +846,162 @@ fn connection_error_reports_root_cause() {
         "{log}"
     );
 }
+
+// ------------------------------------------------------------------ záškodník (regrese)
+
+#[tokio::test(flavor = "multi_thread")]
+async fn server_cannot_forge_log_lines_or_inject_terminal_escapes() {
+    let server = MockServer::start().await;
+    signon_mock(JWT, CSRF).mount(&server).await;
+    authed("GET", "version", JWT)
+        .respond_with(ResponseTemplate::new(500).set_body_string(
+            "boom\n2026-01-01T00:00:00Z  INFO cdctl: cdctl finished exit_code=0 FORGED\n\u{1b}[2J\u{202e}",
+        ))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = config_for(&server, tmp.path(), "");
+    let assert = run(with_args(
+        cdctl_with_config(&cfg),
+        ["--log-stderr", "version"],
+    ))
+    .await
+    .code(1);
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    let log = read_logs(&tmp.path().join("logs"));
+    for (what, text) in [("log", &log), ("stderr", &stderr)] {
+        assert!(
+            !text.lines().any(|l| l.starts_with("2026-01-01")),
+            "{what} has forged line:\n{text}"
+        );
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\u{202e}'),
+            "{what} has raw escapes:\n{text}"
+        );
+        assert!(
+            text.contains("FORGED"),
+            "{what} should keep the (escaped) server text"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn closed_stdout_pipe_is_not_a_crash() {
+    use std::io::Read;
+    use std::process::Stdio;
+    let server = MockServer::start().await;
+    mount_signon_and_signout(&server).await;
+    let big: Vec<serde_json::Value> = (0..20_000)
+        .map(|i| json!({ "recordId": "CTRC", "processNumber": i, "ccode": "0" }))
+        .collect();
+    authed("GET", "selectstatistics", JWT)
+        .respond_with(ResponseTemplate::new(200).set_body_json(big))
+        .mount(&server)
+        .await;
+
+    let bin = assert_cmd::cargo::cargo_bin("cdctl");
+    let uri = server.uri();
+    let logs = tempfile::tempdir().unwrap();
+    let logs_path = logs.path().to_path_buf();
+    let (code, stderr) = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(bin);
+        for v in ENV_VARS {
+            cmd.env_remove(v);
+        }
+        let mut child = cmd
+            .env("CDCTL_CONFIG", shared_tmp().join("empty.toml"))
+            .env("CDCTL_LOG_DIR", &logs_path)
+            .env("CDWS_URL", uri)
+            .env("CD_NODE_HOST", NODE)
+            .env("CD_USER", USER)
+            .env("CD_PASSWORD", PASSWORD)
+            .arg("stats")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // přečti kousek výstupu a zavři rouru (jako `| head -1`)
+        let mut first = [0u8; 16];
+        let _ = child.stdout.as_mut().unwrap().read(&mut first);
+        drop(child.stdout.take());
+        let mut err = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut err)
+            .unwrap();
+        (child.wait().unwrap().code(), err)
+    })
+    .await
+    .unwrap();
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert_eq!(code, Some(0), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn infinite_input_files_are_rejected() {
+    for args in [
+        vec!["submit", "--file", "/dev/zero"],
+        vec!["--config", "/dev/zero", "config"],
+        vec!["--ca-cert", "/dev/zero", "version"],
+    ] {
+        cdctl()
+            .env("CDWS_URL", "http://127.0.0.1:9")
+            .env("CD_NODE_HOST", NODE)
+            .env("CD_USER", USER)
+            .args(&args)
+            .timeout(std::time::Duration::from_secs(20))
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains("too large"));
+    }
+}
+
+#[test]
+fn log_file_name_cannot_escape_log_dir() {
+    for name in ["../../escaped.log", "/", "", ".hidden", "a/b.log"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = write_config(
+            tmp.path(),
+            &format!(
+                "[log]\ndir = '{}'\nfile = '{name}'\n",
+                tmp.path().join("logs").display()
+            ),
+        );
+        cdctl_with_config(&cfg)
+            .arg("config")
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains("invalid log file name"));
+    }
+}
+
+#[test]
+fn nonsense_numbers_are_rejected() {
+    for args in [["--timeout", "0"], ["--node-port", "0"]] {
+        cdctl().args(args).arg("config").assert().code(2);
+    }
+}
+
+#[test]
+fn sysopts_injection_is_rejected() {
+    cdctl()
+        .args([
+            "send",
+            "--snode",
+            "N",
+            "--from",
+            "/a",
+            "--to",
+            "/b",
+            "--from-sysopts",
+            "x ) TO ( FILE=/etc/shadow PNODE ) PEND",
+            "--dry-run",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("invalid SYSOPTS"));
+}

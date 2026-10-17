@@ -554,3 +554,121 @@ fn credentials_debug_hides_password() {
     assert!(s.contains("***"));
     assert!(!s.contains("topsecret"));
 }
+
+// ------------------------------------------------------------- záškodník (regrese)
+
+#[tokio::test]
+async fn redirect_on_sign_on_is_not_followed() {
+    let server = MockServer::start().await;
+    let attacker = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&attacker)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(svc("signon")))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", format!("{}/steal", attacker.uri())),
+        )
+        .mount(&server)
+        .await;
+
+    let err = client(&server).sign_on().await.unwrap_err();
+    assert!(
+        matches!(err, Error::Api { status, ref body } if status.as_u16() == 302 && body.contains("refused"))
+    );
+}
+
+#[tokio::test]
+async fn redirect_on_call_does_not_leak_session_token() {
+    let server = MockServer::start().await;
+    let attacker = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&attacker)
+        .await;
+    signon_mock(JWT, CSRF).mount(&server).await;
+    authed("GET", "version", JWT)
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("Location", format!("{}/steal", attacker.uri())),
+        )
+        .mount(&server)
+        .await;
+
+    let err = client(&server).version().await.unwrap_err();
+    assert!(matches!(err, Error::Api { status, .. } if status.as_u16() == 307));
+}
+
+#[tokio::test]
+async fn oversized_response_is_rejected() {
+    let server = MockServer::start().await;
+    signon_mock(JWT, CSRF).mount(&server).await;
+    authed("GET", "version", JWT)
+        .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(4096)))
+        .mount(&server)
+        .await;
+
+    let mut cfg = config(&server);
+    cfg.max_response_bytes = 1024;
+    let err = CdClient::new(cfg).unwrap().version().await.unwrap_err();
+    assert!(matches!(err, Error::ResponseTooLarge { limit: 1024 }));
+}
+
+#[tokio::test]
+async fn huge_sign_on_token_is_rejected() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(svc("signon")))
+        .respond_with(signon_ok(&"A".repeat(20_000), CSRF))
+        .mount(&server)
+        .await;
+
+    let err = client(&server).sign_on().await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn path_traversal_is_rejected_before_any_request() {
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let c = client(&server);
+    for p in [
+        "../../etc/passwd",
+        "%2e%2e/admin",
+        "version?admin=1",
+        "a\nb",
+    ] {
+        let err = c
+            .call(Method::GET, p, &Query::new(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{p:?}: {err:?}");
+    }
+}
+
+#[test]
+fn dangerous_configs_are_rejected() {
+    for url in [
+        "https://user:pw@cdws:9443",
+        "https://cdws:9443/?x=1",
+        "https://cdws:9443/#f",
+    ] {
+        let cfg = Config::new(url, NODE, USER, PASSWORD);
+        assert!(matches!(CdClient::new(cfg), Err(Error::Config(_))), "{url}");
+    }
+    let mut cfg = Config::new("https://cdws:9443", NODE, USER, PASSWORD);
+    cfg.timeout = Duration::ZERO;
+    assert!(matches!(CdClient::new(cfg), Err(Error::Config(_))));
+    let mut cfg = Config::new("https://cdws:9443", NODE, USER, PASSWORD);
+    cfg.max_response_bytes = 0;
+    assert!(matches!(CdClient::new(cfg), Err(Error::Config(_))));
+}

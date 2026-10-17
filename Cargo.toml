@@ -1,6 +1,6 @@
 [package]
 name = "connect-direct"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Async Rust klient pro IBM Sterling Connect:Direct Web Services (CDWS) REST API"
@@ -50,6 +50,7 @@ assert_cmd = "2"
 predicates = "3"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 tempfile = "3"
+proptest = "1"
 
 [[test]]
 name = "client"

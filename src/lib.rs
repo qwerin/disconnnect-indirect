@@ -22,6 +22,7 @@ mod client;
 mod error;
 mod models;
 mod process;
+mod text;
 
 pub use client::{CdClient, Config, Credentials};
 pub use error::{error_chain, Error, Result};
@@ -30,6 +31,7 @@ pub use models::{
     SubmitProcess,
 };
 pub use process::{CopyProcess, Direction, Disp};
+pub use text::{is_dangerous_char, sanitize};
 
 /// Re-export, aby šlo volat [`CdClient::call`] bez přímé závislosti na reqwest.
 pub use reqwest::Method;

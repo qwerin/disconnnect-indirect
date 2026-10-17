@@ -9,20 +9,47 @@
 mod config;
 mod logging;
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 use connect_direct::{
-    completion_code, error_chain, extract_process_number, CdClient, Config, CopyProcess,
+    completion_code, error_chain, extract_process_number, sanitize, CdClient, Config, CopyProcess,
     DeleteProcess, Direction, Disp, Method, Protocol, Query, SubmitProcess,
 };
 use serde_json::Value;
 use tracing::{debug, error, info, warn, Instrument};
 
-use config::{Loaded, LogFormat, Rotation};
+use config::{Loaded, LogFormat, Rotation, MAX_INPUT_FILE_BYTES};
 use logging::{LogHandle, LogSettings};
+
+static STDOUT_CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// Zápis na stdout. Zavřená roura (`cdctl … | head`) není chyba – zbytek výstupu se zahodí.
+fn out(s: &str) {
+    if STDOUT_CLOSED.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut o = std::io::stdout().lock();
+    if let Err(e) = o.write_all(s.as_bytes()).and_then(|_| o.flush()) {
+        STDOUT_CLOSED.store(true, Ordering::Relaxed);
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            let _ = writeln!(std::io::stderr(), "warning: cannot write to stdout: {e}");
+        }
+    }
+}
+
+/// Řádek na stderr – zneškodněný (žádné escape sekvence ze serveru do terminálu)
+/// a bez paniky, když je stderr zavřený.
+macro_rules! errln {
+    ($($t:tt)*) => {{
+        let line = sanitize(&format!($($t)*));
+        let _ = writeln!(std::io::stderr(), "{line}");
+    }};
+}
 
 #[derive(Parser)]
 #[command(
@@ -52,7 +79,7 @@ struct Conn {
     #[arg(long, env = "CD_NODE_HOST", global = true)]
     node_host: Option<String>,
     /// API port C:D uzlu (výchozí 1363)
-    #[arg(long, env = "CD_NODE_PORT", global = true)]
+    #[arg(long, env = "CD_NODE_PORT", global = true, value_parser = clap::value_parser!(u16).range(1..))]
     node_port: Option<u16>,
     /// TCPIP | NONE | TLS1.2 | TLS1.3 | ... (výchozí TCPIP)
     #[arg(long, env = "CD_PROTOCOL", global = true)]
@@ -68,7 +95,7 @@ struct Conn {
     #[arg(long, env = "CDWS_INSECURE", global = true)]
     insecure: bool,
     /// Timeout HTTP požadavku v sekundách (výchozí 120)
-    #[arg(long, env = "CDWS_TIMEOUT", global = true)]
+    #[arg(long, env = "CDWS_TIMEOUT", global = true, value_parser = clap::value_parser!(u64).range(1..))]
     timeout: Option<u64>,
 }
 
@@ -217,6 +244,7 @@ struct ConnSettings {
     ca_cert: Option<PathBuf>,
     insecure: bool,
     timeout: Duration,
+    max_response_bytes: u64,
 }
 
 fn conn_settings(cli: &Conn, f: &config::ConnectionSection) -> ConnSettings {
@@ -234,6 +262,10 @@ fn conn_settings(cli: &Conn, f: &config::ConnectionSection) -> ConnSettings {
         ca_cert: cli.ca_cert.clone().or_else(|| f.ca_cert.clone()),
         insecure: cli.insecure || f.insecure.unwrap_or(false),
         timeout: Duration::from_secs(cli.timeout.or(f.timeout_secs).unwrap_or(120)),
+        max_response_bytes: f
+            .max_response_mb
+            .unwrap_or(config::DEFAULT_MAX_RESPONSE_MB)
+            .saturating_mul(1024 * 1024),
     }
 }
 
@@ -283,9 +315,10 @@ fn build_client(c: &ConnSettings) -> Result<CdClient, BoxError> {
     cfg.protocol = c.protocol.parse::<Protocol>().unwrap();
     cfg.accept_invalid_certs = c.insecure;
     cfg.timeout = c.timeout;
+    cfg.max_response_bytes = c.max_response_bytes;
     if let Some(p) = &c.ca_cert {
-        let pem = std::fs::read(p)
-            .map_err(|e| format!("cannot read CA certificate {}: {e}", p.display()))?;
+        let pem = config::read_limited(p, MAX_INPUT_FILE_BYTES)
+            .map_err(|e| format!("CA certificate: {e}"))?;
         cfg.extra_root_certs_pem.push(pem);
     }
     Ok(CdClient::new(cfg)?)
@@ -294,10 +327,10 @@ fn build_client(c: &ConnSettings) -> Result<CdClient, BoxError> {
 // ------------------------------------------------------------------ helpers
 
 fn print(v: &Value) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
-    );
+    // serde_json escapuje řídicí znaky v řetězcích, výstup je bezpečný pro terminál
+    let mut text = serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string());
+    text.push('\n');
+    out(&text);
 }
 
 /// Argumenty příkazové řádky pro log – s maskovaným heslem.
@@ -317,7 +350,7 @@ fn sanitized_args() -> String {
             out.push(a);
         }
     }
-    out.join(" ")
+    sanitize(&out.join(" "))
 }
 
 fn os_user() -> String {
@@ -349,7 +382,7 @@ async fn submit_and_maybe_wait(
     }
     let pnum =
         extract_process_number(&resp).ok_or("process number not found in submit response")?;
-    eprintln!("Čekám na dokončení procesu {pnum} ...");
+    errln!("Čekám na dokončení procesu {pnum} ...");
     let rec = client
         .wait_for_process_end(
             pnum,
@@ -359,7 +392,7 @@ async fn submit_and_maybe_wait(
         .await?;
     print(&rec);
     let cc = completion_code(&rec);
-    eprintln!("Completion code: {}", cc.as_deref().unwrap_or("?"));
+    errln!("Completion code: {}", cc.as_deref().unwrap_or("?"));
     Ok(matches!(cc.as_deref(), Some("0") | None))
 }
 
@@ -386,6 +419,7 @@ fn query(n: Option<u64>, name: &Option<String>) -> Query {
 }
 
 fn show_config(loaded: &Loaded, conn: &ConnSettings, ls: &LogSettings, log: &LogHandle) {
+    use std::fmt::Write as _;
     let opt = |v: &Option<String>| v.clone().unwrap_or_else(|| "(not set)".into());
     let config_file = match &loaded.path {
         Some(p) => p.display().to_string(),
@@ -394,45 +428,55 @@ fn show_config(loaded: &Loaded, conn: &ConnSettings, ls: &LogSettings, log: &Log
             config::default_config_path().display()
         ),
     };
-    println!("config file   : {config_file}");
-    println!("[connection]");
-    println!("  url         : {}", opt(&conn.url));
-    println!(
+    let password = if conn.password.as_deref().unwrap_or("").is_empty() {
+        "(not set)"
+    } else {
+        "*** (set)"
+    };
+    let ca_cert = conn
+        .ca_cert
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(system roots)".into());
+
+    let mut t = String::new();
+    let _ = writeln!(t, "config file   : {config_file}");
+    let _ = writeln!(t, "[connection]");
+    let _ = writeln!(t, "  url         : {}", opt(&conn.url));
+    let _ = writeln!(
+        t,
         "  node        : {}:{}",
         opt(&conn.node_host),
         conn.node_port
     );
-    println!("  protocol    : {}", conn.protocol);
-    println!("  user        : {}", opt(&conn.user));
-    println!(
-        "  password    : {}",
-        if conn.password.as_deref().unwrap_or("").is_empty() {
-            "(not set)"
-        } else {
-            "*** (set)"
-        }
+    let _ = writeln!(t, "  protocol    : {}", conn.protocol);
+    let _ = writeln!(t, "  user        : {}", opt(&conn.user));
+    let _ = writeln!(t, "  password    : {password}");
+    let _ = writeln!(t, "  ca_cert     : {ca_cert}");
+    let _ = writeln!(t, "  insecure    : {}", conn.insecure);
+    let _ = writeln!(t, "  timeout     : {} s", conn.timeout.as_secs());
+    let _ = writeln!(
+        t,
+        "  max response: {} MiB",
+        conn.max_response_bytes / (1024 * 1024)
     );
-    println!(
-        "  ca_cert     : {}",
-        conn.ca_cert
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "(system roots)".into())
-    );
-    println!("  insecure    : {}", conn.insecure);
-    println!("  timeout     : {} s", conn.timeout.as_secs());
-    println!("[log]");
-    println!("  file        : {}", log.current_file_hint(ls).display());
+    let _ = writeln!(t, "[log]");
+    let _ = writeln!(t, "  file        : {}", log.current_file_hint(ls).display());
     if let Some((from, why)) = &log.fell_back_from {
-        println!("  (fallback – {} not writable: {why})", from.display());
+        let _ = writeln!(t, "  (fallback – {} not writable: {why})", from.display());
     }
-    println!("  level       : {}", ls.level);
-    println!("  format      : {}", ls.format);
-    println!(
+    let _ = writeln!(t, "  level       : {}", ls.level);
+    let _ = writeln!(t, "  format      : {}", ls.format);
+    let _ = writeln!(
+        t,
         "  rotation    : {} (keep {} files)",
         ls.rotation, ls.max_files
     );
-    println!("  stderr      : {}", ls.stderr);
+    let _ = writeln!(t, "  stderr      : {}", ls.stderr);
+
+    // hodnoty z konfigurace mohou obsahovat cokoli – do terminálu jen zneškodněné
+    let safe: Vec<String> = t.lines().map(sanitize).collect();
+    out(&(safe.join("\n") + "\n"));
 }
 
 // ------------------------------------------------------------------ run
@@ -470,8 +514,8 @@ async fn run(
                 Direction::Receive
             };
             let text = copy_process(dir, a).render()?;
-            info!(direction = ?dir, process = %a.name, "dry run, process not submitted");
-            print!("{text}");
+            info!(direction = ?dir, process = %sanitize(&a.name), "dry run, process not submitted");
+            out(&text);
             return Ok(true);
         }
     }
@@ -490,12 +534,11 @@ async fn run(
         } => {
             let process_file = match (file, server_file) {
                 (Some(f), _) => {
-                    info!(file = %f.display(), "submitting local process file");
-                    std::fs::read_to_string(f)
-                        .map_err(|e| format!("cannot read {}: {e}", f.display()))?
+                    info!(file = %sanitize(&f.display().to_string()), "submitting local process file");
+                    config::read_limited_string(f, MAX_INPUT_FILE_BYTES)?
                 }
                 (None, Some(s)) => {
-                    info!(server_file = %s, "submitting process file on server");
+                    info!(server_file = %sanitize(s), "submitting process file on server");
                     s.clone()
                 }
                 (None, None) => return Err("use --file or --server-file".into()),
@@ -514,10 +557,10 @@ async fn run(
             };
             info!(
                 direction = ?dir,
-                snode = %a.snode,
-                from = %a.from,
-                to = %a.to,
-                process = %a.name,
+                snode = %sanitize(&a.snode),
+                from = %sanitize(&a.from),
+                to = %sanitize(&a.to),
+                process = %sanitize(&a.name),
                 disp = ?a.disp,
                 wait = a.wait.wait,
                 "file transfer requested"
@@ -570,7 +613,7 @@ async fn run(
             for (k, v) in q {
                 query = query.param(k, v);
             }
-            info!(%method, path = %path, "raw API call");
+            info!(%method, path = %sanitize(path), "raw API call");
             print(&client.call(method, path, &query, body.as_ref()).await?);
             true
         }
@@ -578,7 +621,7 @@ async fn run(
     };
 
     if let Err(e) = client.sign_out().await {
-        eprintln!("warning: sign-out failed: {}", error_chain(&e));
+        errln!("warning: sign-out failed: {}", error_chain(&e));
     }
     Ok(ok)
 }
@@ -610,7 +653,7 @@ async fn run_logged(cli: Cli, loaded: Loaded, ls: LogSettings, log: &LogHandle) 
         }
         if let Some(w) = &loaded.permission_warning {
             warn!("{w}");
-            eprintln!("warning: {w}");
+            errln!("warning: {w}");
         }
 
         let result = run(cli, &loaded, &ls, log).await;
@@ -628,9 +671,9 @@ async fn run_logged(cli: Cli, loaded: Loaded, ls: LogSettings, log: &LogHandle) 
                 ExitCode::from(2)
             }
             Err(e) => {
-                let msg = error_chain(e.as_ref());
+                let msg = sanitize(&error_chain(e.as_ref()));
                 error!(exit_code = 1, elapsed_ms, error = %msg, "cdctl failed");
-                eprintln!("error: {msg}");
+                errln!("error: {msg}");
                 ExitCode::FAILURE
             }
         }
@@ -645,21 +688,25 @@ fn main() -> ExitCode {
     let loaded = match config::load(cli.config.as_deref()) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("error: {e}");
+            errln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
 
     let ls = log_settings(&cli.log, &loaded.cfg.log);
+    if ls.level.trim().is_empty() {
+        errln!("error: log level must not be empty");
+        return ExitCode::FAILURE;
+    }
     let log = match logging::init(&ls) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("error: {e}");
+            errln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
     if let Some((from, why)) = &log.fell_back_from {
-        eprintln!(
+        errln!(
             "warning: cannot write log to {} ({why}); logging to {} instead",
             from.display(),
             log.dir.display()
@@ -672,7 +719,7 @@ fn main() -> ExitCode {
     {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("error: cannot start async runtime: {e}");
+            errln!("error: cannot start async runtime: {e}");
             return ExitCode::FAILURE;
         }
     };

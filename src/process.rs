@@ -1,6 +1,7 @@
 //! Generátor textu Connect:Direct procesu (COPY) – aby se nemusel psát ručně.
 
 use crate::error::{Error, Result};
+use crate::text::{is_dangerous_char, sanitize};
 
 /// Dispozice cílového souboru (`DISP=`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -150,11 +151,7 @@ impl CopyProcess {
         let from = quote_path(&self.from)?;
         let to = quote_path(&self.to)?;
         for s in [&self.from_sysopts, &self.to_sysopts].into_iter().flatten() {
-            if s.contains(['\n', '\r']) {
-                return Err(Error::InvalidProcess(
-                    "SYSOPTS must not contain newlines".into(),
-                ));
-            }
+            validate_sysopts(s)?;
         }
 
         let (from_node, to_node) = match self.direction {
@@ -216,18 +213,85 @@ fn validate_node(s: &str) -> Result<()> {
 }
 
 /// Cesty s mezerami nebo speciálními znaky obalí uvozovkami.
+///
+/// Odmítá uvozovky (nešlo by z nich bezpečně „utéct“), řídicí znaky, oddělovače
+/// řádků a bidi přepínače.
 fn quote_path(path: &str) -> Result<String> {
-    if path.is_empty() || path.contains(['"', '\n', '\r']) {
-        return Err(Error::InvalidProcess(format!("invalid file path `{path}`")));
+    if path.is_empty()
+        || path.len() > 4096
+        || path.contains('"')
+        || path.chars().any(is_dangerous_char)
+    {
+        return Err(Error::InvalidProcess(format!(
+            "invalid file path `{}`",
+            sanitize(path)
+        )));
     }
     let needs_quotes = path
         .chars()
-        .any(|c| c.is_whitespace() || "(),=;&".contains(c));
+        .any(|c| c.is_whitespace() || "(),=;&'".contains(c));
+    if needs_quotes && path.ends_with('\\') {
+        // `"C:\dir\"` by C:D četl jako escapovanou uvozovku a řetězec by neskončil
+        return Err(Error::InvalidProcess(format!(
+            "invalid file path `{}`: a quoted path must not end with a backslash",
+            sanitize(path)
+        )));
+    }
     Ok(if needs_quotes {
         format!("\"{path}\"")
     } else {
         path.to_string()
     })
+}
+
+/// SYSOPTS se vkládá doslova, ale nesmí rozbít strukturu procesu.
+///
+/// Povolené tvary:
+/// * řetězec v uvozovkách `"…"`, uvnitř jen escapované `\"` (např. `":datatype=text:"`,
+///   windowsové `"\"datatype(text)\""`),
+/// * řetězec v apostrofech `'…'` bez dalších apostrofů,
+/// * jeden token bez mezer, závorek, čárek, středníků a uvozovek.
+fn validate_sysopts(s: &str) -> Result<()> {
+    let invalid = |why: &str| {
+        Err(Error::InvalidProcess(format!(
+            "invalid SYSOPTS `{}`: {why}",
+            sanitize(s)
+        )))
+    };
+    if s.is_empty() || s.len() > 1024 {
+        return invalid("must be 1-1024 bytes");
+    }
+    if s.chars().any(is_dangerous_char) {
+        return invalid("control characters are not allowed");
+    }
+    let b = s.as_bytes();
+    if b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"' {
+        let inner = &s[1..s.len() - 1];
+        let mut escaped = false;
+        for c in inner.chars() {
+            match (c, escaped) {
+                ('\\', false) => escaped = true,
+                ('"', false) => return invalid("unescaped quote inside quoted value"),
+                _ => escaped = false,
+            }
+        }
+        if escaped {
+            return invalid("dangling backslash before closing quote");
+        }
+        return Ok(());
+    }
+    if b.len() >= 2 && b[0] == b'\'' && b[b.len() - 1] == b'\'' {
+        if s[1..s.len() - 1].contains('\'') {
+            return invalid("apostrophe inside apostrophe-quoted value");
+        }
+        return Ok(());
+    }
+    if s.chars()
+        .any(|c| c.is_whitespace() || "()\",;'".contains(c))
+    {
+        return invalid("unquoted value must not contain spaces, ( ) , ; or quotes");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -312,7 +376,9 @@ mod tests {
 
     #[test]
     fn quotes_paths_with_special_chars() {
-        for path in ["/a b", "/a(1)", "/a,b", "/a=b", "/a;b", "/a&b", "C:\\x\ty"] {
+        for path in [
+            "/a b", "/a(1)", "/a,b", "/a=b", "/a;b", "/a&b", "/a'b", "C:\\x y",
+        ] {
             let p = CopyProcess::send("P", "N", path, "/b").render().unwrap();
             assert!(
                 p.contains(&format!("FILE=\"{path}\"")),
@@ -390,5 +456,53 @@ mod tests {
         assert_eq!(p.matches('(').count(), p.matches(')').count());
         assert_eq!(p.lines().last(), Some("PEND"));
         assert_eq!(p.matches("PROCESS").count(), 1);
+    }
+
+    #[test]
+    fn sysopts_cannot_break_out_of_block() {
+        for bad in [
+            "x ) TO ( FILE=/etc/shadow PNODE ) PEND",
+            "\":a:\" ) PEND",
+            "\"a\"b\"",
+            "\"abc\\\"",
+            "'a'b'",
+            "a,b",
+            "a;b",
+            "(x)",
+            "\"",
+            "",
+            "\u{1b}[2J",
+        ] {
+            let r = CopyProcess::send("P", "N", "/a", "/b")
+                .from_sysopts(bad)
+                .render();
+            assert!(r.is_err(), "SYSOPTS {bad:?} must be rejected");
+        }
+        for good in [
+            "\":datatype=text:\"",
+            "\"\\\"datatype(text)\\\"\"",
+            "'DATATYPE=TEXT'",
+            ":xlate=yes:",
+            "\"a b (c), d; e\"",
+        ] {
+            let r = CopyProcess::send("P", "N", "/a", "/b")
+                .from_sysopts(good)
+                .render();
+            assert!(r.is_ok(), "SYSOPTS {good:?} must be accepted: {r:?}");
+        }
+    }
+
+    #[test]
+    fn control_and_bidi_chars_in_paths_are_rejected() {
+        for bad in [
+            "/a\tb",
+            "/a\u{1b}[31m",
+            "/a\u{2028}b",
+            "/a\u{202e}b",
+            "/a\0b",
+        ] {
+            let r = CopyProcess::send("P", "N", bad, "/b").render();
+            assert!(r.is_err(), "path {bad:?} must be rejected");
+        }
     }
 }
