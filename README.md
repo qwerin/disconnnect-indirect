@@ -3,6 +3,8 @@
 [![CI](https://github.com/qwerin/disconnnect-indirect/actions/workflows/ci.yml/badge.svg)](https://github.com/qwerin/disconnnect-indirect/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+Co se v jednotlivých verzích změnilo: [CHANGELOG.md](CHANGELOG.md).
+
 Async Rust klient (a CLI `cdctl`) pro **IBM Sterling Connect:Direct Web Services (CDWS)** REST API.
 
 Funkce: sign-on/sign-out se správou JWT + XSRF tokenu, automatický re-login při 401,
@@ -24,8 +26,10 @@ tar xzf cdctl-x86_64-unknown-linux-musl.tar.gz && ./cdctl --version
 
 Build z každého commitu v `main` je také v záložce *Actions* jako artefakt `cdctl-linux-amd64`.
 
-**Vydání nové verze:** zvednout `version` v `Cargo.toml`, commit, pak `git tag v0.2.0 && git push --tags`.
-Workflow ověří, že tag odpovídá verzi, sestaví binárku a založí GitHub Release.
+**Vydání nové verze:** v [`CHANGELOG.md`](CHANGELOG.md) přejmenovat sekci `[Unreleased]` na novou verzi s datem
+(a založit novou prázdnou `[Unreleased]`), zvednout `version` v `Cargo.toml`, commit, pak `git tag v0.4.0 && git push --tags`.
+Workflow ověří, že tag odpovídá verzi a changelog ji obsahuje, sestaví binárku a založí GitHub Release
+s textem z changelogu.
 
 ## Knihovna
 

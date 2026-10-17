@@ -44,6 +44,8 @@ jobs:
             echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${CRATE_VERSION}"
             exit 1
           fi
+          python3 scripts/changelog.py section "${GITHUB_REF_NAME}" > /dev/null \
+            || { echo "::error::CHANGELOG.md has no section for ${GITHUB_REF_NAME}"; exit 1; }
 
       - name: build release binary
         run: cargo build --release --locked --target "$TARGET" --bin cdctl
@@ -95,6 +97,18 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # tagy kvůli odkazu na předchozí verzi
+      - name: release notes from CHANGELOG.md
+        run: |
+          python3 scripts/changelog.py section "${GITHUB_REF_NAME}" > release-notes.md
+          PREV=$(git tag --sort=-v:refname | grep -A1 -x "${GITHUB_REF_NAME}" | tail -n +2 || true)
+          if [ -n "$PREV" ]; then
+            printf '\n**Všechny změny:** %s/compare/%s...%s\n' "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$PREV" "$GITHUB_REF_NAME" >> release-notes.md
+          fi
+          cat release-notes.md
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cdctl-linux-amd64
@@ -102,5 +116,5 @@ jobs:
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: dist/*
-          generate_release_notes: true
+          body_path: release-notes.md
           fail_on_unmatched_files: true

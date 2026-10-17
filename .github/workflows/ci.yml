@@ -34,6 +34,16 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  changelog:
+    name: changelog
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: CHANGELOG.md is valid and documents the Cargo.toml version
+        run: python3 scripts/changelog.py check
+
   clippy:
     name: clippy
     runs-on: ubuntu-latest
